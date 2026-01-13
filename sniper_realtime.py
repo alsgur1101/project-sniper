@@ -1,52 +1,64 @@
 import asyncio
 import websockets
 import json
+from collections import deque  # <--- 핵심: 데이터를 담을 그릇
 from datetime import datetime
 
-# 감시할 코인 목록 (원화 마켓)
-target_codes = ["KRW-BTC", "KRW-ETH", "KRW-XRP"]
+# 감시할 코인
+TARGET_CODE = "KRW-BTC"
+
+# 최근 가격 15개를 저장할 큐(Queue) 생성 (꽉 차면 옛날 데이터 자동 삭제)
+price_queue = deque(maxlen=15)
 
 async def upbit_ws_client():
     uri = "wss://api.upbit.com/websocket/v1"
     
     async with websockets.connect(uri) as websocket:
-        print(f"✅ 업비트 서버 연결 성공! 감시 대상: {target_codes}")
+        print(f"✅ [{TARGET_CODE}] 실시간 이동평균 감시 시작...")
         
-        # 1. 원하는 데이터 요청 (구독 신청)
         subscribe_fmt = [
             {"ticket": "sniper-ticket"},
-            {"type": "ticker", "codes": target_codes, "isOnlyRealtime": True},
-            {"format": "SIMPLE"} # 간소화된 응답 포맷
+            {"type": "ticker", "codes": [TARGET_CODE], "isOnlyRealtime": True},
+            {"format": "SIMPLE"}
         ]
         
-        # JSON으로 변환해서 서버로 전송
         await websocket.send(json.dumps(subscribe_fmt))
         
-        # 2. 데이터 무한 수신 루프
         while True:
             try:
                 data = await websocket.recv()
-                data = json.loads(data) # JSON 파싱
+                data = json.loads(data)
                 
-                # 데이터 추출
-                code = data['cd']           # 종목 코드 (예: KRW-BTC)
-                price = data['tp']          # 현재가 (Trade Price)
-                change = data['scr']        # 등락률 (Signed Change Rate)
+                # 데이터 파싱
+                price = data['tp'] # 현재가
                 
-                # 시간 찍기
-                now = datetime.now().strftime("%H:%M:%S")
+                # 1. 큐에 현재 가격 저장
+                price_queue.append(price)
                 
-                # 색깔 입히기 (상승:빨강, 하락:파랑 - 터미널 설정에 따라 다를 수 있음)
-                # 윈도우 기본 터미널에선 특수문자 깨질 수 있으니 단순 텍스트로
-                print(f"[{now}] 🚀 {code} : {price:,.0f}원 ({change*100:.2f}%)")
+                # 2. 이동평균 계산 (데이터가 어느 정도 모였을 때만)
+                if len(price_queue) == price_queue.maxlen:
+                    avg_price = sum(price_queue) / len(price_queue) # 평균가
+                    diff = price - avg_price # 현재가 - 평균가
+                    
+                    # 3. 판단 로직 (골든크로스/데드크로스 흉내)
+                    status = "보합 ➡️"
+                    if diff > 0:
+                        status = "상승 📈" # 평균보다 비싸짐
+                    elif diff < 0:
+                        status = "하락 📉" # 평균보다 싸짐
+                        
+                    now = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{now}] 현재가: {price:,.0f} | 평균가: {avg_price:,.0f} | {status} (차이: {diff:,.0f})")
                 
+                else:
+                    print(f"데이터 모으는 중... ({len(price_queue)}/15)")
+
             except Exception as e:
-                print(f"❌ 에러 발생: {e}")
+                print(f"에러: {e}")
                 break
 
-# 비동기 실행 진입점
 if __name__ == "__main__":
     try:
         asyncio.run(upbit_ws_client())
     except KeyboardInterrupt:
-        print("\n🛑 프로그램을 종료합니다.")
+        print("\n종료합니다.")
