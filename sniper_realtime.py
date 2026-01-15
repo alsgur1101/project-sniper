@@ -1,20 +1,34 @@
 import asyncio
 import websockets
 import json
-from collections import deque  # <--- 핵심: 데이터를 담을 그릇
+import csv  # <--- 추가됨: 엑셀 파일 처리를 위한 라이브러리
+import os   # <--- 추가됨: 파일이 있는지 없는지 확인용
+from collections import deque
 from datetime import datetime
 
-# 감시할 코인
 TARGET_CODE = "KRW-BTC"
-
-# 최근 가격 15개를 저장할 큐(Queue) 생성 (꽉 차면 옛날 데이터 자동 삭제)
 price_queue = deque(maxlen=15)
+LOG_FILE = "sniper_log.csv" # 저장할 파일 이름
+
+# 💾 CSV 저장 함수 (블랙박스 기록)
+def save_to_csv(timestamp, price, avg_price, diff, status):
+    file_exists = os.path.isfile(LOG_FILE)
+    
+    # 'a' 모드: 덮어쓰지 않고 뒤에 계속 이어붙이기 (Append)
+    with open(LOG_FILE, mode='a', newline='', encoding='utf-8-sig') as file:
+        writer = csv.writer(file)
+        
+        # 파일이 처음 생길 때만 맨 윗줄(헤더) 작성
+        if not file_exists:
+            writer.writerow(["시간", "현재가", "이동평균", "차이", "상태"])
+            
+        writer.writerow([timestamp, price, avg_price, diff, status])
 
 async def upbit_ws_client():
     uri = "wss://api.upbit.com/websocket/v1"
     
     async with websockets.connect(uri) as websocket:
-        print(f"✅ [{TARGET_CODE}] 실시간 이동평균 감시 시작...")
+        print(f"✅ [{TARGET_CODE}] 기록을 시작합니다... (파일명: {LOG_FILE})")
         
         subscribe_fmt = [
             {"ticket": "sniper-ticket"},
@@ -29,30 +43,25 @@ async def upbit_ws_client():
                 data = await websocket.recv()
                 data = json.loads(data)
                 
-                # 데이터 파싱
-                price = data['tp'] # 현재가
-                
-                # 1. 큐에 현재 가격 저장
+                price = data['tp']
                 price_queue.append(price)
                 
-                # 2. 이동평균 계산 (데이터가 어느 정도 모였을 때만)
                 if len(price_queue) == price_queue.maxlen:
-                    avg_price = sum(price_queue) / len(price_queue) # 평균가
-                    diff = price - avg_price # 현재가 - 평균가
+                    avg_price = sum(price_queue) / len(price_queue)
+                    diff = price - avg_price
                     
-                    # 3. 판단 로직 (골든크로스/데드크로스 흉내)
-                    status = "보합 ➡️"
-                    if diff > 0:
-                        status = "상승 📈" # 평균보다 비싸짐
-                    elif diff < 0:
-                        status = "하락 📉" # 평균보다 싸짐
+                    status = "보합"
+                    if diff > 0: status = "상승"
+                    elif diff < 0: status = "하락"
                         
-                    now = datetime.now().strftime("%H:%M:%S")
-                    print(f"[{now}] 현재가: {price:,.0f} | 평균가: {avg_price:,.0f} | {status} (차이: {diff:,.0f})")
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # 1. 화면 출력
+                    print(f"[{now}] {price:,.0f}원 | {status} (이격: {diff:,.1f}) -> 기록됨 💾")
+                    
+                    # 2. 파일 저장 (여기가 핵심!)
+                    save_to_csv(now, price, avg_price, diff, status)
                 
-                else:
-                    print(f"데이터 모으는 중... ({len(price_queue)}/15)")
-
             except Exception as e:
                 print(f"에러: {e}")
                 break
