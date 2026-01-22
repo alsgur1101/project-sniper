@@ -9,20 +9,23 @@ import time
 from collections import deque
 from datetime import datetime
 
-# 1. 환경변수 로드
 load_dotenv()
 SLACK_URL = os.getenv("SLACK_URL")
 
-# 🎯 감시할 타겟 목록 (여러 개 추가 가능!)
 TARGETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL"]
-
-# 🗂️ 각 종목별로 데이터를 담을 '딕셔너리' 생성
-# 구조: { "KRW-BTC": deque(...), "KRW-ETH": deque(...), ... }
 price_queues = {code: deque(maxlen=50) for code in TARGETS}
 
-# 쿨타임 관리 (종목별로 따로 관리해야 함!)
-last_alert_times = {code: 0 for code in TARGETS}
-ALERT_COOLDOWN = 60 
+# 💰 [신규] 가상 지갑 설정
+# 1,000만원으로 시작
+WALLET = {
+    "KRW": 10_000_000, 
+    "COINS": {code: {"vol": 0.0, "avg": 0.0} for code in TARGETS}
+}
+BUY_AMOUNT = 1_000_000 # 한 번 살 때 100만원어치 매수
+
+# 쿨타임 (너무 자주 사고팔지 않게)
+last_trade_time = {code: 0 for code in TARGETS}
+TRADE_COOLDOWN = 60 # 1분
 
 def send_slack(msg):
     if not SLACK_URL: return
@@ -32,8 +35,7 @@ def send_slack(msg):
         print(f"슬랙 전송 실패: {e}")
 
 def calculate_rsi(prices, period=14):
-    if len(prices) < period:
-        return None
+    if len(prices) < period: return None
     series = pd.Series(prices)
     delta = series.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -42,15 +44,63 @@ def calculate_rsi(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.iloc[-1]
 
+# 💸 [신규] 매수 함수
+def buy_coin(code, price):
+    # 돈이 부족하면 패스
+    if WALLET["KRW"] < BUY_AMOUNT:
+        print("❌ 잔액 부족으로 매수 실패")
+        return
+
+    # 수수료(0.05%) 고려해서 매수량 계산
+    volume = (BUY_AMOUNT * 0.9995) / price
+    
+    # 지갑 업데이트 (돈 나가고 코인 들어옴)
+    WALLET["KRW"] -= BUY_AMOUNT
+    
+    # 평단가 재계산 (기존 보유량 + 신규 매수량)
+    prev_vol = WALLET["COINS"][code]["vol"]
+    prev_avg = WALLET["COINS"][code]["avg"]
+    new_vol = prev_vol + volume
+    new_avg = ((prev_vol * prev_avg) + (volume * price)) / new_vol
+    
+    WALLET["COINS"][code]["vol"] = new_vol
+    WALLET["COINS"][code]["avg"] = new_avg
+    
+    msg = f"💎 [모의 매수] {code}\n가격: {price:,.0f}원\n수량: {volume:.4f}개\n잔액: {WALLET['KRW']:,.0f}원"
+    print(msg)
+    send_slack(msg)
+
+# 💸 [신규] 매도 함수
+def sell_coin(code, price):
+    volume = WALLET["COINS"][code]["vol"]
+    
+    # 가진 게 없으면 패스
+    if volume == 0: return
+    
+    # 수익률 계산
+    avg_price = WALLET["COINS"][code]["avg"]
+    profit_rate = ((price - avg_price) / avg_price) * 100
+    
+    # 매도 금액 (수수료 제외)
+    sell_amount = (volume * price) * 0.9995
+    
+    # 지갑 업데이트
+    WALLET["KRW"] += sell_amount
+    WALLET["COINS"][code]["vol"] = 0
+    WALLET["COINS"][code]["avg"] = 0
+    
+    icon = "🎉" if profit_rate > 0 else "💧"
+    msg = f"{icon} [모의 매도] {code}\n매도가: {price:,.0f}원\n수익률: {profit_rate:.2f}%\n총 자산: {WALLET['KRW']:,.0f}원"
+    print(msg)
+    send_slack(msg)
+
 async def upbit_ws_client():
     uri = "wss://api.upbit.com/websocket/v1"
     
     async with websockets.connect(uri) as websocket:
-        print(f"✅ 멀티 타겟 스나이퍼 가동! 감시 대상: {len(TARGETS)}개")
-        print(f"🎯 목록: {TARGETS}")
-        send_slack(f"📡 멀티 스나이퍼 가동 시작! ({len(TARGETS)}개 종목 감시)")
+        print(f"✅ 가상 매매 봇 가동! 시작 자산: {WALLET['KRW']:,.0f}원")
+        send_slack(f"🏦 모의투자 시스템 가동 (시드: 1,000만원)")
         
-        # 구독 요청 (코드를 리스트로 한 번에 보냅니다)
         subscribe_fmt = [
             {"ticket": "sniper-ticket"},
             {"type": "ticker", "codes": TARGETS, "isOnlyRealtime": True},
@@ -64,34 +114,33 @@ async def upbit_ws_client():
                 data = await websocket.recv()
                 data = json.loads(data)
                 
-                # 1. 데이터 분류 (Demux)
-                code = data['cd']       # 종목 코드 확인
-                price = data['tp']      # 가격 확인
-                
-                # 해당 종목의 큐에 데이터 넣기
+                code = data['cd']
+                price = data['tp']
                 price_queues[code].append(price)
                 
-                # 2. 분석 및 판단
                 if len(price_queues[code]) > 15:
                     rsi = calculate_rsi(list(price_queues[code]))
+                    if rsi is None: continue
                     
-                    if rsi is not None:
-                        now = datetime.now().strftime("%H:%M:%S")
+                    now = datetime.now().strftime("%H:%M:%S")
+                    current_time = time.time()
+                    
+                    # 🚦 매매 전략 (RSI 기반)
+                    # 1. 매수 (RSI 30 이하 & 쿨타임 지남 & 미보유 시)
+                    if rsi <= 30 and (current_time - last_trade_time[code] > TRADE_COOLDOWN):
+                        if WALLET["COINS"][code]["vol"] == 0: # 없을 때만 산다 (단순화)
+                            buy_coin(code, price)
+                            last_trade_time[code] = current_time
+
+                    # 2. 매도 (RSI 70 이상 & 보유 중일 때)
+                    elif rsi >= 70 and WALLET["COINS"][code]["vol"] > 0:
+                        sell_coin(code, price)
+                        last_trade_time[code] = current_time
                         
-                        # 중요할 때만 출력 (너무 시끄러우니까)
-                        # RSI가 35 이하(약세)거나 65 이상(강세)일 때만 로그 찍기
-                        if rsi <= 35 or rsi >= 65:
-                            status = "🔥 과열" if rsi >= 65 else "❄️ 침체"
-                            print(f"[{now}] {code} | {price:,.0f}원 | RSI: {rsi:.1f} ({status})")
-                        
-                        # 🔔 알림 로직 (종목별 쿨타임 적용)
-                        current_time = time.time()
-                        if (rsi <= 30 or rsi >= 70) and (current_time - last_alert_times[code] > ALERT_COOLDOWN):
-                            condition = "매수 기회 (과매도) 🟢" if rsi <= 30 else "매도 주의 (과매수) 🔴"
-                            msg = f"🚨 [{code}] 신호 포착!\n현재가: {price:,.0f}원\nRSI: {rsi:.1f}\n상태: {condition}"
-                            send_slack(msg)
-                            last_alert_times[code] = current_time
-                            print(f">>> 📲 {code} 슬랙 알림 전송!")
+                    # 상태 출력 (가끔씩만)
+                    if rsi <= 35 or rsi >= 65:
+                        status = "🔥 과열" if rsi >= 65 else "❄️ 침체"
+                        print(f"[{now}] {code} | {price:,.0f} | RSI:{rsi:.1f} | {status}")
 
             except Exception as e:
                 print(f"에러: {e}")
@@ -106,5 +155,4 @@ if __name__ == "__main__":
             print("\n종료합니다.")
             break
         except Exception as e:
-            print("재접속 중...")
             time.sleep(3)
