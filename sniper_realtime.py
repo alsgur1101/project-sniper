@@ -15,17 +15,45 @@ SLACK_URL = os.getenv("SLACK_URL")
 TARGETS = ["KRW-BTC", "KRW-ETH", "KRW-XRP", "KRW-SOL"]
 price_queues = {code: deque(maxlen=50) for code in TARGETS}
 
-# 💰 [신규] 가상 지갑 설정
-# 1,000만원으로 시작
-WALLET = {
-    "KRW": 10_000_000, 
-    "COINS": {code: {"vol": 0.0, "avg": 0.0} for code in TARGETS}
-}
-BUY_AMOUNT = 1_000_000 # 한 번 살 때 100만원어치 매수
+# 💾 세이브 파일 이름
+WALLET_FILE = "wallet.json"
+BUY_AMOUNT = 1_000_000 
 
-# 쿨타임 (너무 자주 사고팔지 않게)
+# 쿨타임
 last_trade_time = {code: 0 for code in TARGETS}
-TRADE_COOLDOWN = 60 # 1분
+TRADE_COOLDOWN = 60
+
+# --- 💾 저장/불러오기 기능 추가 ---
+
+def save_wallet(wallet_data):
+    """지갑 상태를 JSON 파일로 저장"""
+    try:
+        with open(WALLET_FILE, 'w', encoding='utf-8') as f:
+            json.dump(wallet_data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        print(f"❌ 세이브 실패: {e}")
+
+def load_wallet():
+    """파일이 있으면 불러오고, 없으면 초기값 리턴"""
+    if os.path.exists(WALLET_FILE):
+        try:
+            with open(WALLET_FILE, 'r', encoding='utf-8') as f:
+                print("📂 기존 지갑(세이브 파일)을 불러옵니다.")
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ 파일 읽기 실패(초기화): {e}")
+            
+    # 파일이 없으면 초기 상태 리턴
+    print("✨ 새 지갑을 생성합니다.")
+    return {
+        "KRW": 10_000_000, 
+        "COINS": {code: {"vol": 0.0, "avg": 0.0} for code in TARGETS}
+    }
+
+# 프로그램 시작 시 지갑 로드
+WALLET = load_wallet()
+
+# ----------------------------------
 
 def send_slack(msg):
     if not SLACK_URL: return
@@ -44,50 +72,42 @@ def calculate_rsi(prices, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi.iloc[-1]
 
-# 💸 [신규] 매수 함수
 def buy_coin(code, price):
-    # 돈이 부족하면 패스
     if WALLET["KRW"] < BUY_AMOUNT:
-        print("❌ 잔액 부족으로 매수 실패")
+        print("❌ 잔액 부족")
         return
 
-    # 수수료(0.05%) 고려해서 매수량 계산
     volume = (BUY_AMOUNT * 0.9995) / price
-    
-    # 지갑 업데이트 (돈 나가고 코인 들어옴)
     WALLET["KRW"] -= BUY_AMOUNT
     
-    # 평단가 재계산 (기존 보유량 + 신규 매수량)
-    prev_vol = WALLET["COINS"][code]["vol"]
-    prev_avg = WALLET["COINS"][code]["avg"]
+    prev_vol = WALLET["COINS"].get(code, {"vol": 0})["vol"]
+    prev_avg = WALLET["COINS"].get(code, {"avg": 0})["avg"]
+    
     new_vol = prev_vol + volume
     new_avg = ((prev_vol * prev_avg) + (volume * price)) / new_vol
     
-    WALLET["COINS"][code]["vol"] = new_vol
-    WALLET["COINS"][code]["avg"] = new_avg
+    WALLET["COINS"][code] = {"vol": new_vol, "avg": new_avg}
+    
+    save_wallet(WALLET) # 💾 매매할 때마다 자동 저장!
     
     msg = f"💎 [모의 매수] {code}\n가격: {price:,.0f}원\n수량: {volume:.4f}개\n잔액: {WALLET['KRW']:,.0f}원"
     print(msg)
     send_slack(msg)
 
-# 💸 [신규] 매도 함수
 def sell_coin(code, price):
+    if code not in WALLET["COINS"] or WALLET["COINS"][code]["vol"] == 0:
+        return
+        
     volume = WALLET["COINS"][code]["vol"]
-    
-    # 가진 게 없으면 패스
-    if volume == 0: return
-    
-    # 수익률 계산
     avg_price = WALLET["COINS"][code]["avg"]
     profit_rate = ((price - avg_price) / avg_price) * 100
-    
-    # 매도 금액 (수수료 제외)
     sell_amount = (volume * price) * 0.9995
     
-    # 지갑 업데이트
     WALLET["KRW"] += sell_amount
     WALLET["COINS"][code]["vol"] = 0
     WALLET["COINS"][code]["avg"] = 0
+    
+    save_wallet(WALLET) # 💾 매매할 때마다 자동 저장!
     
     icon = "🎉" if profit_rate > 0 else "💧"
     msg = f"{icon} [모의 매도] {code}\n매도가: {price:,.0f}원\n수익률: {profit_rate:.2f}%\n총 자산: {WALLET['KRW']:,.0f}원"
@@ -98,8 +118,7 @@ async def upbit_ws_client():
     uri = "wss://api.upbit.com/websocket/v1"
     
     async with websockets.connect(uri) as websocket:
-        print(f"✅ 가상 매매 봇 가동! 시작 자산: {WALLET['KRW']:,.0f}원")
-        send_slack(f"🏦 모의투자 시스템 가동 (시드: 1,000만원)")
+        print(f"✅ 봇 가동! 현재 자산: {WALLET['KRW']:,.0f}원")
         
         subscribe_fmt = [
             {"ticket": "sniper-ticket"},
@@ -122,25 +141,22 @@ async def upbit_ws_client():
                     rsi = calculate_rsi(list(price_queues[code]))
                     if rsi is None: continue
                     
-                    now = datetime.now().strftime("%H:%M:%S")
                     current_time = time.time()
                     
-                    # 🚦 매매 전략 (RSI 기반)
-                    # 1. 매수 (RSI 30 이하 & 쿨타임 지남 & 미보유 시)
+                    # 🚦 RSI 기준값 조정 (테스트를 위해 좀 더 느슨하게 잡음)
+                    # 매수: 30이하 / 매도: 70이상
                     if rsi <= 30 and (current_time - last_trade_time[code] > TRADE_COOLDOWN):
-                        if WALLET["COINS"][code]["vol"] == 0: # 없을 때만 산다 (단순화)
+                        if WALLET["COINS"][code]["vol"] == 0:
                             buy_coin(code, price)
                             last_trade_time[code] = current_time
 
-                    # 2. 매도 (RSI 70 이상 & 보유 중일 때)
                     elif rsi >= 70 and WALLET["COINS"][code]["vol"] > 0:
                         sell_coin(code, price)
                         last_trade_time[code] = current_time
                         
-                    # 상태 출력 (가끔씩만)
+                    # 로그는 100번 중 1번 정도만 출력 (터미널 도배 방지)
                     if rsi <= 35 or rsi >= 65:
-                        status = "🔥 과열" if rsi >= 65 else "❄️ 침체"
-                        print(f"[{now}] {code} | {price:,.0f} | RSI:{rsi:.1f} | {status}")
+                         print(f"[{code}] {price:,.0f}원 | RSI: {rsi:.1f}")
 
             except Exception as e:
                 print(f"에러: {e}")
